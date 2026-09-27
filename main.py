@@ -5,11 +5,9 @@ Vera AI Challenge - bot server
 from __future__ import annotations
 
 import asyncio
-import collections
 import json
 import os
 import re
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -33,46 +31,6 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_TIMEOUT_SECONDS = (
     8  # even with concurrency, one slow call shouldn't eat the whole tick budget
 )
-
-# --- rate-limit handling -----------------------------------------------------
-# Concurrency was capped first, but the last judge_simulator run showed that
-# wasn't the real constraint: batches 2-4 still 429'd on nearly every call
-# even one-at-a-time-ish through the semaphore, taking 12s+ per batch on
-# retries that never succeeded. Several successes, then a long failure
-# stretch, then recovery - that's a per-minute quota, not a burst/concurrency
-# issue. So on top of the concurrency cap, track our own call rate in a
-# sliding window and skip the network call entirely once we're at budget,
-# rather than making a call we already know will 429 and paying for a retry
-# that can't outlast a 60s window anyway.
-GEMINI_MAX_CONCURRENT = 2
-GEMINI_SEMAPHORE = threading.Semaphore(GEMINI_MAX_CONCURRENT)
-GEMINI_MAX_RETRIES = 2
-GEMINI_RETRY_BASE_DELAY = 1.5  # seconds; backoff for genuine transient 500/503 only
-
-# TUNE THESE TWO to your key's actual RPM for gemini-3.1-flash-lite - check
-# Google AI Studio -> your project -> quota/usage for the real number and
-# leave a little headroom below it. 8/60s is a placeholder starting point.
-GEMINI_RATE_LIMIT_CALLS = 8
-GEMINI_RATE_LIMIT_WINDOW = 60.0  # seconds
-_gemini_call_times: collections.deque[float] = collections.deque()
-_gemini_rate_lock = threading.Lock()
-
-
-def _gemini_rate_limit_ok() -> bool:
-    """True (and reserves a slot) if we're under budget for the current
-    window; False if calling now would just burn a 429 we already expect."""
-    now = time.monotonic()
-    with _gemini_rate_lock:
-        while (
-            _gemini_call_times
-            and now - _gemini_call_times[0] > GEMINI_RATE_LIMIT_WINDOW
-        ):
-            _gemini_call_times.popleft()
-        if len(_gemini_call_times) >= GEMINI_RATE_LIMIT_CALLS:
-            return False
-        _gemini_call_times.append(now)
-        return True
-
 
 VALID_SCOPES = {"category", "merchant", "customer", "trigger"}
 
@@ -186,9 +144,9 @@ Hard rules:
 - Ground every claim in the JSON context you're given. Never invent a number, offer, citation, or competitor name that isn't in the context.
 - Anchor on one verifiable fact from the trigger's OWN payload (context.trigger.details) - a number, date, deadline, or named item that is specific to why THIS trigger fired today. Never generic phrasing.
 - Do NOT default to CTR/views/calls performance numbers as your anchor unless context.trigger.kind is itself a performance trigger (perf_dip, perf_spike, seasonal_perf_dip, ctr_below_peer_median-type signals). For every other trigger.kind (festival_upcoming, curious_ask_due, winback_eligible, milestone_reached, etc.) the anchor fact MUST come from that trigger's own details, even if merchant.performance data is also present in the context - performance numbers there are background, not the reason for this message.
-- Match the category's voice: use voice.tone and vocab_allowed; NEVER use any word from voice.vocab_taboo/voice.taboos. If voice.tone is "peer_clinical", address the owner with their professional title (e.g. "Dr. <name>"), not just their first name.
+- Match the category's voice: read voice.tone AND actually work at least one word/phrase from voice.vocab_allowed into the message where it fits naturally (don't force it if nothing fits) - this is what makes the message sound like an industry peer instead of a generic template. NEVER use any word from voice.vocab_taboo/voice.taboos. If voice.tone is "peer_clinical", address the owner with their professional title (e.g. "Dr. <name>"), not just their first name. If voice.tone is "coaching" or "motivational" (gyms), write with energy and encouragement, not clinical/analytical phrasing - avoid sounding like a dashboard report. If voice.tone is "warm_friendly" or similar (salons, restaurants), keep it conversational and personable, not formal.
 - Check "trigger.scope". If it is "customer", this event is about ONE OF THE MERCHANT'S CUSTOMERS/PATIENTS (a recall, a lapsed visit, a trial follow-up, etc.) - it is NEVER about the merchant themselves. Never phrase it as if the merchant/owner is the one due for the service. If a "customer" object is provided, use their real name. If no "customer" object is provided, refer to them generically ("a patient", "one of your regulars") - do not invent a name, and do not substitute the merchant's own name/needs into that sentence.
-- Match the merchant's (or customer's) language preference - Hindi-English code-mix is fine and often preferred; don't force pure English on a hi/hi-en preference.
+- Match the merchant's (or customer's) language preference from context.merchant.languages / context.customer.language_pref. If it includes "hi" or is "hi-en mix", you MUST actually write with natural Hindi-English code-mix (e.g. "Apke liye", "kal tak", "bhej doon?") rather than writing pure English and merely being willing to - a pure-English message when hi-en was requested is a miss, not a safe default.
 - Exactly one call-to-action, placed in the last sentence. Choose "cta" from: open_ended, binary_yes_no, binary_confirm_cancel, multi_choice_slot, none. Use "none" only for pure-information triggers.
 - No URLs.
 - No preamble ("Hope you're doing well..."), no re-introducing yourself, be concise.
@@ -202,14 +160,6 @@ def _call_gemini(system_prompt: str, user_prompt: str) -> dict | None:
     if not GEMINI_API_KEY:
         print("[gemini] SKIPPED - GEMINI_API_KEY is empty in this process")
         return None
-
-    if not _gemini_rate_limit_ok():
-        print(
-            "[gemini] SKIPPED - local rate budget exhausted this window, "
-            "falling back to template without hitting the API"
-        )
-        return None
-
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     body = json.dumps(
         {
@@ -225,40 +175,14 @@ def _call_gemini(system_prompt: str, user_prompt: str) -> dict | None:
     req = urllib.request.Request(
         url, data=body, method="POST", headers={"Content-Type": "application/json"}
     )
-
-    # Throttle + retry around the actual network call. This blocks the calling
-    # worker thread (asyncio.to_thread), not the event loop, so other candidates
-    # in the same tick just queue behind the semaphore instead of all firing
-    # at once and tripping Gemini's own rate limit.
-    with GEMINI_SEMAPHORE:
-        for attempt in range(GEMINI_MAX_RETRIES + 1):
-            try:
-                with urllib.request.urlopen(
-                    req, timeout=GEMINI_TIMEOUT_SECONDS
-                ) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text)
-            except urllib.error.HTTPError as e:
-                # 429 is quota, not a blip - the limiter above should already
-                # keep us under it, and retrying a real 429 within a few
-                # seconds doesn't help (confirmed last run: every retried 429
-                # still failed). Only retry 500/503 - genuine transient
-                # backend overload per Google's own error docs.
-                if e.code in (500, 503) and attempt < GEMINI_MAX_RETRIES:
-                    delay = GEMINI_RETRY_BASE_DELAY * (2**attempt)
-                    print(
-                        f"[gemini] {e.code} (attempt {attempt + 1}/{GEMINI_MAX_RETRIES}) - "
-                        f"retrying in {delay:.1f}s"
-                    )
-                    time.sleep(delay)
-                    continue
-                print(f"[gemini] CALL FAILED: HTTPError {e.code}: {e}")
-                return None
-            except Exception as e:  # noqa: BLE001 - any failure must fall back to the template, never raise
-                print(f"[gemini] CALL FAILED: {type(e).__name__}: {e}")
-                return None
-    return None
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except Exception as e:  # noqa: BLE001 - any failure must fall back to the template, never raise
+        print(f"[gemini] CALL FAILED: {type(e).__name__}: {e}")
+        return None
 
 
 def _llm_compose(
@@ -343,35 +267,6 @@ def _honorific(category: dict, identity: dict) -> str:
     if tone == "peer_clinical":
         return f"Dr. {name}"
     return name
-
-
-def _voice_flavor(category: dict) -> tuple[str, str]:
-    """Picks a connector line and a CTA line to match category.voice.tone, using
-    a word from vocab_allowed where one fits and never touching vocab_taboo.
-    This is the piece the template path was missing entirely - it's why fallback
-    messages tanked Category Fit even when _trigger_headline had the right fact
-    (e.g. Karthik's customer_lapsed_hard message: 24/50, Category Fit 3/10)."""
-    voice = category.get("voice", {}) or {}
-    tone = voice.get("tone", "")
-    vocab_allowed = voice.get("vocab_allowed", []) or []
-    taboo = set(voice.get("vocab_taboo", []) or voice.get("taboos", []) or [])
-
-    def pick(options: list[str], fallback: str) -> str:
-        for w in options:
-            if w in vocab_allowed and w not in taboo:
-                return w
-        return fallback
-
-    if tone == "peer_clinical":
-        connector = "Wanted to flag this for you directly."
-        cta_word = pick(["recommend", "advise"], "recommend")
-        return connector, f"Want me to {cta_word} next steps?"
-    if tone in ("casual", "friendly", "warm"):
-        connector = "Thought you'd want to know."
-        cta_word = pick(["go ahead", "sort it", "set it up"], "go ahead")
-        return connector, f"Want me to {cta_word}?"
-    connector = "Sharing this so you're in the loop."
-    return connector, "Want me to go ahead?"
 
 
 def _trigger_headline(category: dict, merchant: dict, trigger: dict) -> str | None:
@@ -470,7 +365,6 @@ def _template_compose(category: dict, merchant: dict, trigger: dict) -> tuple[st
     offers = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
     kind = trigger.get("kind", "update")
     greet_name = _honorific(category, identity)
-    connector, voiced_cta = _voice_flavor(category)
 
     headline = _trigger_headline(category, merchant, trigger)
     parts = [f"{greet_name},"]
@@ -488,7 +382,7 @@ def _template_compose(category: dict, merchant: dict, trigger: dict) -> tuple[st
             )
         else:
             parts.append(
-                f"{connector} we spotted a {kind.replace('_', ' ')} signal for your store in {locality}."
+                f"we spotted a {kind.replace('_', ' ')} signal for your store in {locality}."
             )
 
     if offers:
@@ -509,7 +403,7 @@ def _template_compose(category: dict, merchant: dict, trigger: dict) -> tuple[st
         parts.append("Want me to draft a short WhatsApp message around it?")
         cta = "open_ended"
     else:
-        parts.append(voiced_cta)
+        parts.append("Want me to go ahead?")
         cta = "binary_yes_no"
 
     return " ".join(parts), cta
@@ -614,12 +508,12 @@ async def tick(request: Request):
             break
 
     # Pass 2 (the slow part - each may make a real Gemini call): run all of them
-    # CONCURRENTLY instead of one-after-another. compose_body() itself is still
-    # synchronous (blocking urllib), so each one runs in its own thread via
-    # asyncio.to_thread rather than blocking the event loop or each other. The
-    # GEMINI_SEMAPHORE inside _call_gemini caps how many of those threads are
-    # actually hitting the network at once, so this can stay "fire them all"
-    # without re-triggering the rate limit.
+    # CONCURRENTLY instead of one-after-another. Sequential composition of N
+    # triggers was blowing well past the tick time budget (N x up to
+    # GEMINI_TIMEOUT_SECONDS each, worst case) - this is what was causing
+    # "Tick failed: timed out". compose_body() itself is still synchronous
+    # (blocking urllib), so each one runs in its own thread via asyncio.to_thread
+    # rather than blocking the event loop or each other.
     results = await asyncio.gather(
         *[
             asyncio.to_thread(
